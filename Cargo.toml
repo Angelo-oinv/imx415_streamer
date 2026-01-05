@@ -1,0 +1,33 @@
+[package]
+name = "imx415_streamer"
+version = "0.1.0"
+edition = "2021"
+description = "IMX415 camera streamer for Rock5C - captures grayscale frames and streams via HTTP"
+
+[dependencies]
+# Web server
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+# Image processing
+image = "0.25"
+
+# No external V4L2 crate needed - using v4l2-ctl command
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+parking_lot = "0.12"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# For MJPEG streaming
+futures = "0.3"
+tokio-stream = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
