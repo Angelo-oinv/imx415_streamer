@@ -1,13 +1,11 @@
 //! V4L2 capture module for IMX415 sensor
 //!
-//! Handles raw frame capture from /dev/video9 (CIF bypass path)
-//! and extracts the clean grayscale data from byte 4 of each 5-byte group.
+//! Uses byte-4 extraction with row averaging, upscaled to 4K
 
 use anyhow::{Context, Result};
 use image::GrayImage;
 use image::codecs::jpeg::JpegEncoder;
 use std::process::{Command, Stdio};
-use std::io::Read;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,10 +16,10 @@ static FRAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct CaptureConfig {
     pub device_path: String,
     pub sensor_subdev: String,
-    pub width: u32,
-    pub height: u32,
-    pub stride: usize,
-    pub groups_per_row: usize,
+    pub output_width: u32,   // Final output: 3840
+    pub output_height: u32,  // Final output: 2160
+    pub stride: usize,       // Raw stride: 4864
+    pub groups_per_row: usize, // 960
     pub link_frequency: u32,
     pub jpeg_quality: u8,
     pub temp_dir: PathBuf,
@@ -32,11 +30,11 @@ impl Default for CaptureConfig {
         Self {
             device_path: "/dev/video9".to_string(),
             sensor_subdev: "/dev/v4l-subdev3".to_string(),
-            width: 3840,
-            height: 2160,
+            output_width: 3840,
+            output_height: 2160,
             stride: 4864,
             groups_per_row: 960,
-            link_frequency: 0, // 297MHz for stability
+            link_frequency: 0,
             jpeg_quality: 85,
             temp_dir: PathBuf::from("/tmp/imx415_capture"),
         }
@@ -46,38 +44,38 @@ impl Default for CaptureConfig {
 /// Frame capture instance
 pub struct FrameCapture {
     config: CaptureConfig,
-    // Reusable buffers
-    grayscale_buffer: Vec<u8>,
-    upscaled_buffer: Vec<u8>,
+    // Native buffer: 960x1080 (byte-4 + row averaging)
+    native_buffer: Vec<u8>,
+    // Output buffer: 3840x2160 (4K upscaled)
+    output_buffer: Vec<u8>,
     jpeg_buffer: Vec<u8>,
 }
 
 impl FrameCapture {
-    /// Create new capture instance
     pub fn new() -> Result<Self> {
         Self::with_config(CaptureConfig::default())
     }
 
-    /// Create with custom config
     pub fn with_config(config: CaptureConfig) -> Result<Self> {
-        // Create temp directory
         fs::create_dir_all(&config.temp_dir)?;
         
-        // Pre-allocate buffers
-        let native_size = config.groups_per_row * config.height as usize;
-        let upscaled_size = config.width as usize * config.height as usize;
+        // Native: 960x1080
+        let native_w = config.groups_per_row;
+        let native_h = 1080;
+        let native_size = native_w * native_h;
+        
+        // Output: 3840x2160
+        let output_size = config.output_width as usize * config.output_height as usize;
         
         Ok(Self {
             config,
-            grayscale_buffer: vec![0u8; native_size],
-            upscaled_buffer: vec![0u8; upscaled_size],
-            jpeg_buffer: Vec::with_capacity(2 * 1024 * 1024), // 2MB initial
+            native_buffer: vec![0u8; native_size],
+            output_buffer: vec![0u8; output_size],
+            jpeg_buffer: Vec::with_capacity(2 * 1024 * 1024),
         })
     }
 
-    /// Setup sensor parameters
     pub fn setup_sensor(&self) -> Result<()> {
-        // Set link frequency for stable MIPI transfer
         let output = Command::new("v4l2-ctl")
             .args([
                 "-d", &self.config.sensor_subdev,
@@ -92,27 +90,24 @@ impl FrameCapture {
                           String::from_utf8_lossy(&output.stderr));
         }
 
-        // Reset gain
         let _ = Command::new("v4l2-ctl")
             .args(["-d", &self.config.sensor_subdev, "--set-ctrl", "analogue_gain=0"])
             .output();
 
-        tracing::info!("Sensor configured: link_freq={}", self.config.link_frequency);
+        tracing::info!("Sensor configured");
         Ok(())
     }
 
-    /// Start video streaming (no-op for v4l2-ctl based capture)
     pub fn start_streaming(&mut self) -> Result<()> {
-        tracing::info!("Capture ready (using v4l2-ctl)");
+        tracing::info!("Capture ready: {}x{} (4K upscaled grayscale)", 
+                      self.config.output_width, self.config.output_height);
         Ok(())
     }
 
-    /// Capture a single raw frame using v4l2-ctl
     fn capture_raw_frame(&self) -> Result<Vec<u8>> {
         let frame_num = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
         let raw_path = self.config.temp_dir.join(format!("frame_{}.raw", frame_num % 4));
         
-        // Capture using v4l2-ctl
         let output = Command::new("v4l2-ctl")
             .args([
                 "-d", &self.config.device_path,
@@ -129,73 +124,94 @@ impl FrameCapture {
             anyhow::bail!("v4l2-ctl capture failed");
         }
         
-        // Read the raw file
-        let raw_data = fs::read(&raw_path)
-            .context("Failed to read raw frame")?;
-        
-        // Clean up (optional, keep for debugging)
+        let raw_data = fs::read(&raw_path).context("Failed to read raw frame")?;
         let _ = fs::remove_file(&raw_path);
         
         Ok(raw_data)
     }
 
-    /// Extract grayscale from raw data
-    /// 
-    /// The raw data is 10-bit packed (5 bytes = 4 pixels), but only
-    /// byte 4 of each 5-byte group contains clean image data.
-    fn extract_grayscale(&mut self, raw_data: &[u8]) {
-        let height = self.config.height as usize;
+    /// Extract byte-4 with row averaging → 960x1080
+    fn extract_byte4_averaged(&mut self, raw: &[u8]) {
         let stride = self.config.stride;
         let groups = self.config.groups_per_row;
+        let out_height = 1080;
         
-        // Extract byte 4 from each 5-byte group
-        for row in 0..height {
-            let row_start = row * stride;
-            let output_row_start = row * groups;
+        for out_y in 0..out_height {
+            let row0 = out_y * 2;
+            let row1 = row0 + 1;
+            let row0_start = row0 * stride;
+            let row1_start = row1 * stride;
+            let out_row_start = out_y * groups;
             
             for g in 0..groups {
-                let idx = row_start + g * 5 + 4;
-                if idx < raw_data.len() {
-                    self.grayscale_buffer[output_row_start + g] = raw_data[idx];
-                }
+                let idx0 = row0_start + g * 5 + 4;
+                let idx1 = row1_start + g * 5 + 4;
+                
+                let v0 = raw.get(idx0).copied().unwrap_or(0) as u16;
+                let v1 = raw.get(idx1).copied().unwrap_or(0) as u16;
+                
+                self.native_buffer[out_row_start + g] = ((v0 + v1) / 2) as u8;
             }
         }
     }
 
-    /// Upscale grayscale to full resolution using bilinear interpolation
-    fn upscale_grayscale(&mut self) {
-        let src_width = self.config.groups_per_row;
-        let src_height = self.config.height as usize;
-        let dst_width = self.config.width as usize;
-        let dst_height = self.config.height as usize;
+    /// Upscale 960x1080 → 3840x2160 using bilinear interpolation
+    fn upscale_to_4k(&mut self) {
+        let src_w = self.config.groups_per_row;  // 960
+        let src_h = 1080;
+        let dst_w = self.config.output_width as usize;   // 3840
+        let dst_h = self.config.output_height as usize;  // 2160
         
-        // Use integer arithmetic for speed
-        let x_scale = (src_width << 16) / dst_width;
-        let y_scale = (src_height << 16) / dst_height;
+        // Scale factors (fixed point 16-bit fraction)
+        let x_ratio = ((src_w - 1) << 16) / (dst_w - 1);
+        let y_ratio = ((src_h - 1) << 16) / (dst_h - 1);
         
-        for dst_y in 0..dst_height {
-            let src_y = ((dst_y * y_scale) >> 16).min(src_height - 1);
-            let dst_row = dst_y * dst_width;
-            let src_row = src_y * src_width;
+        for dst_y in 0..dst_h {
+            let src_y_fp = dst_y * y_ratio;
+            let src_y0 = src_y_fp >> 16;
+            let src_y1 = (src_y0 + 1).min(src_h - 1);
+            let y_frac = (src_y_fp & 0xFFFF) as u32;
             
-            for dst_x in 0..dst_width {
-                let src_x = ((dst_x * x_scale) >> 16).min(src_width - 1);
-                self.upscaled_buffer[dst_row + dst_x] = self.grayscale_buffer[src_row + src_x];
+            let dst_row = dst_y * dst_w;
+            
+            for dst_x in 0..dst_w {
+                let src_x_fp = dst_x * x_ratio;
+                let src_x0 = src_x_fp >> 16;
+                let src_x1 = (src_x0 + 1).min(src_w - 1);
+                let x_frac = (src_x_fp & 0xFFFF) as u32;
+                
+                // Get 4 source pixels
+                let p00 = self.native_buffer[src_y0 * src_w + src_x0] as u32;
+                let p01 = self.native_buffer[src_y0 * src_w + src_x1] as u32;
+                let p10 = self.native_buffer[src_y1 * src_w + src_x0] as u32;
+                let p11 = self.native_buffer[src_y1 * src_w + src_x1] as u32;
+                
+                // Bilinear interpolation
+                let x_inv = 0x10000 - x_frac;
+                let y_inv = 0x10000 - y_frac;
+                
+                let top = (p00 * x_inv + p01 * x_frac) >> 16;
+                let bot = (p10 * x_inv + p11 * x_frac) >> 16;
+                let val = (top * y_inv + bot * y_frac) >> 16;
+                
+                self.output_buffer[dst_row + dst_x] = val as u8;
             }
         }
     }
 
-    /// Encode image to JPEG
     fn encode_jpeg(&mut self) -> Result<Vec<u8>> {
         self.jpeg_buffer.clear();
         
         let image = GrayImage::from_raw(
-            self.config.width,
-            self.config.height,
-            self.upscaled_buffer.clone(),
-        ).context("Failed to create image")?;
+            self.config.output_width,
+            self.config.output_height,
+            self.output_buffer.clone(),
+        ).context("Failed to create grayscale image")?;
         
-        let mut encoder = JpegEncoder::new_with_quality(&mut self.jpeg_buffer, self.config.jpeg_quality);
+        let mut encoder = JpegEncoder::new_with_quality(
+            &mut self.jpeg_buffer, 
+            self.config.jpeg_quality
+        );
         encoder.encode(
             image.as_raw(),
             image.width(),
@@ -206,22 +222,14 @@ impl FrameCapture {
         Ok(self.jpeg_buffer.clone())
     }
 
-    /// Capture and return JPEG-encoded frame
+    /// Capture and return 4K grayscale JPEG
     pub fn capture_jpeg_frame(&mut self) -> Result<Vec<u8>> {
-        // Capture raw
         let raw_data = self.capture_raw_frame()?;
-        
-        // Extract grayscale
-        self.extract_grayscale(&raw_data);
-        
-        // Upscale
-        self.upscale_grayscale();
-        
-        // Encode to JPEG
+        self.extract_byte4_averaged(&raw_data);
+        self.upscale_to_4k();
         self.encode_jpeg()
     }
 
-    /// Get current configuration
     #[allow(dead_code)]
     pub fn config(&self) -> &CaptureConfig {
         &self.config
@@ -230,7 +238,6 @@ impl FrameCapture {
 
 impl Drop for FrameCapture {
     fn drop(&mut self) {
-        // Clean up temp directory
         let _ = fs::remove_dir_all(&self.config.temp_dir);
         tracing::info!("Capture stopped");
     }

@@ -244,7 +244,7 @@ async fn index_handler() -> Html<String> {
 </head>
 <body>
     <h1>IMX415 LIVE</h1>
-    <p class="subtitle">Rock5C • Grayscale • 3840×2160</p>
+    <p class="subtitle">Rock5C • Grayscale 4K • 3840×2160</p>
     
     <div class="mode-selector">
         <button class="mode-btn active" onclick="setMode('mjpeg')">MJPEG Stream</button>
