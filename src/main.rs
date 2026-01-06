@@ -3,8 +3,10 @@
 //! Captures frames from IMX415 sensor (bypassing ISP) and
 //! streams them to web browsers via MJPEG or single frame endpoints.
 //! Supports both grayscale (artifact-free) and color (experimental) modes.
+//! Optional YOLO object detection via Rock5C NPU (RKNN-Lite).
 
 mod capture;
+mod detector;
 
 use anyhow::Result;
 use axum::{
@@ -17,6 +19,7 @@ use axum::{
 };
 use bytes::Bytes;
 use capture::{CaptureMode, FrameCapture};
+use detector::{DetectionResult, YoloDetector};
 use parking_lot::RwLock;
 use std::{sync::Arc, time::Duration};
 use tokio::time::interval;
@@ -31,6 +34,10 @@ struct AppState {
     capture: RwLock<Option<FrameCapture>>,
     frame_count: RwLock<u64>,
     current_mode: RwLock<CaptureMode>,
+    // Detection state
+    detector: RwLock<Option<YoloDetector>>,
+    detection_enabled: RwLock<bool>,
+    last_detections: RwLock<DetectionResult>,
 }
 
 impl AppState {
@@ -40,6 +47,9 @@ impl AppState {
             capture: RwLock::new(None),
             frame_count: RwLock::new(0),
             current_mode: RwLock::new(CaptureMode::Grayscale), // Start with grayscale (stable)
+            detector: RwLock::new(None),
+            detection_enabled: RwLock::new(false),
+            last_detections: RwLock::new(DetectionResult::default()),
         }
     }
 }
@@ -65,6 +75,17 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState::new());
     *state.capture.write() = Some(capture);
 
+    // Try to initialize YOLO detector (optional - will work without it)
+    match YoloDetector::new() {
+        Ok(detector) => {
+            info!("YOLO detector initialized (NPU)");
+            *state.detector.write() = Some(detector);
+        }
+        Err(e) => {
+            info!("YOLO detector not available: {} (detection disabled)", e);
+        }
+    }
+
     let capture_state = state.clone();
     tokio::spawn(async move {
         capture_loop(capture_state).await;
@@ -76,6 +97,8 @@ async fn main() -> Result<()> {
         .route("/stream", get(mjpeg_stream_handler))
         .route("/status", get(status_handler))
         .route("/mode/:mode", get(set_mode_handler))
+        .route("/detect/:enabled", get(set_detection_handler))
+        .route("/detections", get(detections_handler))
         .with_state(state);
 
     let addr = "0.0.0.0:8080";
@@ -84,6 +107,7 @@ async fn main() -> Result<()> {
     info!("  - Single frame: http://<ip>:8080/frame.jpg");
     info!("  - MJPEG stream: http://<ip>:8080/stream");
     info!("  - Set mode: http://<ip>:8080/mode/grayscale or /mode/color");
+    info!("  - Toggle detection: http://<ip>:8080/detect/on or /detect/off");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -93,6 +117,7 @@ async fn main() -> Result<()> {
 
 async fn capture_loop(state: SharedState) {
     let mut interval = interval(Duration::from_millis(33));
+    let mut detection_frame_counter = 0u32;
     
     loop {
         interval.tick().await;
@@ -107,7 +132,39 @@ async fn capture_loop(state: SharedState) {
         };
         
         match frame_result {
-            Ok(jpeg_data) => {
+            Ok(mut jpeg_data) => {
+                let detection_enabled = *state.detection_enabled.read();
+                
+                // Run detection every 3rd frame to maintain framerate
+                if detection_enabled {
+                    detection_frame_counter += 1;
+                    
+                    if detection_frame_counter % 3 == 0 {
+                        // Send frame to detector
+                        if let Some(ref detector) = *state.detector.read() {
+                            if detection_frame_counter % 30 == 0 {
+                                tracing::info!("Sending frame {} to detector ({} bytes)", detection_frame_counter, jpeg_data.len());
+                            }
+                            let _ = detector.detect(jpeg_data.clone());
+                        }
+                    }
+                    
+                    // Get latest detection results
+                    if let Some(ref detector) = *state.detector.read() {
+                        let result = detector.get_last_result();
+                        *state.last_detections.write() = result;
+                    }
+                    
+                    // Draw detection boxes on frame
+                    let detections = state.last_detections.read();
+                    if !detections.detections.is_empty() {
+                        match detector::draw_detections(&jpeg_data, &detections.detections) {
+                            Ok(annotated) => jpeg_data = annotated,
+                            Err(e) => tracing::warn!("Failed to draw detections: {}", e),
+                        }
+                    }
+                }
+                
                 *state.current_frame.write() = Some(Bytes::from(jpeg_data));
                 *state.frame_count.write() += 1;
             }
@@ -147,11 +204,72 @@ async fn set_mode_handler(
     }))
 }
 
+/// Toggle detection endpoint
+async fn set_detection_handler(
+    State(state): State<SharedState>,
+    Path(enabled): Path<String>,
+) -> axum::Json<serde_json::Value> {
+    let enable = match enabled.to_lowercase().as_str() {
+        "on" | "true" | "1" | "enable" | "enabled" => true,
+        "off" | "false" | "0" | "disable" | "disabled" => false,
+        _ => {
+            return axum::Json(serde_json::json!({
+                "error": "Invalid value. Use 'on' or 'off'"
+            }));
+        }
+    };
+    
+    // Check if detector is available
+    let detector_available = state.detector.read().is_some();
+    if enable && !detector_available {
+        return axum::Json(serde_json::json!({
+            "error": "YOLO detector not available (RKNN runtime not installed)",
+            "detection_enabled": false
+        }));
+    }
+    
+    *state.detection_enabled.write() = enable;
+    tracing::info!("Detection {}!", if enable { "ENABLED" } else { "DISABLED" });
+    
+    // Clear detections when disabling
+    if !enable {
+        *state.last_detections.write() = DetectionResult::default();
+    }
+    
+    axum::Json(serde_json::json!({
+        "detection_enabled": enable,
+        "success": true
+    }))
+}
+
+/// Get current detections endpoint
+async fn detections_handler(State(state): State<SharedState>) -> axum::Json<serde_json::Value> {
+    let detections = state.last_detections.read().clone();
+    let enabled = *state.detection_enabled.read();
+    
+    axum::Json(serde_json::json!({
+        "enabled": enabled,
+        "detections": detections.detections,
+        "count": detections.detections.len()
+    }))
+}
+
 async fn index_handler(State(state): State<SharedState>) -> Html<String> {
     let current_mode = *state.current_mode.read();
+    let detection_enabled = *state.detection_enabled.read();
+    let detector_available = state.detector.read().is_some();
+    
     let mode_str = match current_mode {
         CaptureMode::Grayscale => "grayscale",
         CaptureMode::Color => "color",
+    };
+    
+    let (detect_checked, detect_status, detect_status_class) = if !detector_available {
+        ("disabled", "unavailable", "")
+    } else if detection_enabled {
+        ("checked", "active", "active")
+    } else {
+        ("", "off", "")
     };
     
     let html = format!(r##"<!DOCTYPE html>
@@ -314,6 +432,85 @@ async fn index_handler(State(state): State<SharedState>) -> Html<String> {
             color: white;
             font-size: 1.2rem;
         }}
+        .detect-toggle {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 15px;
+            padding: 8px 16px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 25px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+        .detect-toggle label {{
+            color: #888;
+            font-size: 0.9rem;
+            cursor: pointer;
+        }}
+        .detect-toggle input[type="checkbox"] {{
+            width: 40px;
+            height: 20px;
+            appearance: none;
+            background: #333;
+            border-radius: 10px;
+            position: relative;
+            cursor: pointer;
+            transition: background 0.3s;
+        }}
+        .detect-toggle input[type="checkbox"]:checked {{
+            background: linear-gradient(135deg, #00d4ff 0%, #7b2cbf 100%);
+        }}
+        .detect-toggle input[type="checkbox"]::before {{
+            content: '';
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            background: white;
+            border-radius: 50%;
+            top: 2px;
+            left: 2px;
+            transition: transform 0.3s;
+        }}
+        .detect-toggle input[type="checkbox"]:checked::before {{
+            transform: translateX(20px);
+        }}
+        .detect-toggle .detect-status {{
+            font-size: 0.75rem;
+            color: #666;
+        }}
+        .detect-toggle .detect-status.active {{
+            color: #00d4ff;
+        }}
+        .detection-info {{
+            display: none;
+            margin-top: 15px;
+            padding: 12px 20px;
+            background: rgba(0, 212, 255, 0.1);
+            border: 1px solid rgba(0, 212, 255, 0.3);
+            border-radius: 10px;
+            font-size: 0.85rem;
+        }}
+        .detection-info.visible {{
+            display: block;
+        }}
+        .detection-list {{
+            max-height: 150px;
+            overflow-y: auto;
+            margin-top: 8px;
+        }}
+        .detection-item {{
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }}
+        .detection-class {{
+            color: #00d4ff;
+            font-weight: 500;
+        }}
+        .detection-conf {{
+            color: #888;
+        }}
     </style>
 </head>
 <body>
@@ -334,6 +531,12 @@ async fn index_handler(State(state): State<SharedState>) -> Html<String> {
     <div class="stream-selector">
         <button class="stream-btn active" onclick="setStreamMode('mjpeg')">MJPEG</button>
         <button class="stream-btn" onclick="setStreamMode('polling')">Polling</button>
+    </div>
+    
+    <div class="detect-toggle">
+        <label for="detectToggle">🎯 YOLO Detection</label>
+        <input type="checkbox" id="detectToggle" onchange="toggleDetection(this.checked)" {detect_checked}>
+        <span class="detect-status {detect_status_class}" id="detectStatus">{detect_status}</span>
     </div>
     
     <div class="video-container">
@@ -359,6 +562,15 @@ async fn index_handler(State(state): State<SharedState>) -> Html<String> {
             <span>FPS:</span>
             <span class="stat-value" id="fps">--</span>
         </div>
+        <div class="stat">
+            <span>Objects:</span>
+            <span class="stat-value" id="objectCount">0</span>
+        </div>
+    </div>
+    
+    <div class="detection-info" id="detectionInfo">
+        <strong>🎯 Detected Objects:</strong>
+        <div class="detection-list" id="detectionList"></div>
     </div>
     
     <script>
@@ -434,6 +646,61 @@ async fn index_handler(State(state): State<SharedState>) -> Html<String> {
             }}
         }}
         
+        async function toggleDetection(enabled) {{
+            try {{
+                const res = await fetch('/detect/' + (enabled ? 'on' : 'off'));
+                const data = await res.json();
+                
+                const status = document.getElementById('detectStatus');
+                const info = document.getElementById('detectionInfo');
+                
+                if (data.error) {{
+                    alert(data.error);
+                    document.getElementById('detectToggle').checked = false;
+                    status.textContent = 'unavailable';
+                    status.className = 'detect-status';
+                    return;
+                }}
+                
+                if (data.detection_enabled) {{
+                    status.textContent = 'active';
+                    status.className = 'detect-status active';
+                    info.classList.add('visible');
+                }} else {{
+                    status.textContent = 'off';
+                    status.className = 'detect-status';
+                    info.classList.remove('visible');
+                    document.getElementById('objectCount').textContent = '0';
+                    document.getElementById('detectionList').innerHTML = '';
+                }}
+            }} catch (e) {{
+                console.error('Failed to toggle detection:', e);
+            }}
+        }}
+        
+        async function updateDetections() {{
+            if (!document.getElementById('detectToggle').checked) return;
+            
+            try {{
+                const res = await fetch('/detections');
+                const data = await res.json();
+                
+                document.getElementById('objectCount').textContent = data.count;
+                
+                const list = document.getElementById('detectionList');
+                if (data.detections && data.detections.length > 0) {{
+                    list.innerHTML = data.detections.map(d => 
+                        `<div class="detection-item">
+                            <span class="detection-class">${{d.class}}</span>
+                            <span class="detection-conf">${{(d.confidence * 100).toFixed(1)}}%</span>
+                        </div>`
+                    ).join('');
+                }} else {{
+                    list.innerHTML = '<div style="color:#666">No objects detected</div>';
+                }}
+            }} catch (e) {{}}
+        }}
+        
         setInterval(async () => {{
             try {{
                 const res = await fetch('/status');
@@ -444,6 +711,9 @@ async fn index_handler(State(state): State<SharedState>) -> Html<String> {
                 document.getElementById('fps').textContent = fps;
                 lastCount = data.frame_count;
             }} catch (e) {{}}
+            
+            // Update detections
+            updateDetections();
         }}, 1000);
     </script>
 </body>
@@ -454,7 +724,10 @@ async fn index_handler(State(state): State<SharedState>) -> Html<String> {
         mode_info = match current_mode {
             CaptureMode::Grayscale => "✓ Artifact-free • Byte-4 extraction with row averaging",
             CaptureMode::Color => "🧪 Experimental • 10-bit Bayer demosaicing",
-        }
+        },
+        detect_checked = detect_checked,
+        detect_status = detect_status,
+        detect_status_class = detect_status_class,
     );
     
     Html(html)
@@ -516,11 +789,17 @@ async fn status_handler(State(state): State<SharedState>) -> impl IntoResponse {
     let frame_count = *state.frame_count.read();
     let has_frame = state.current_frame.read().is_some();
     let mode = *state.current_mode.read();
+    let detection_enabled = *state.detection_enabled.read();
+    let detection_count = state.last_detections.read().detections.len();
+    let detector_available = state.detector.read().is_some();
     
     axum::Json(serde_json::json!({
         "frame_count": frame_count,
         "has_frame": has_frame,
         "resolution": "3840x2160",
-        "mode": format!("{:?}", mode).to_lowercase()
+        "mode": format!("{:?}", mode).to_lowercase(),
+        "detection_enabled": detection_enabled,
+        "detection_count": detection_count,
+        "detector_available": detector_available
     }))
 }
