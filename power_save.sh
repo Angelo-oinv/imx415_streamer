@@ -37,20 +37,30 @@ check_isp_status() {
     # Check if ISP device exists
     if [ -c "$ISP_VIDEO" ]; then
         isp_accessible=1
-        # Check if ISP is in use
-        if lsof "$ISP_VIDEO" "$ISP_MEDIA" 2>/dev/null | grep -q .; then
+        
+        # Check if any process is actively using /dev/video0 (ISP mainpath)
+        # Use multiple methods for reliability
+        if fuser "$ISP_VIDEO" 2>/dev/null | grep -q . || \
+           lsof "$ISP_VIDEO" 2>/dev/null | grep -qv "COMMAND"; then
             isp_in_use=1
             isp_active=1
         fi
+        
+        # Also check if there's an active stream by trying to query format
+        # (this is a lighter check - just verifies device is accessible)
+        if v4l2-ctl -d "$ISP_VIDEO" --get-fmt-video >/dev/null 2>&1; then
+            # Device is accessible, but check if something is actually streaming
+            # If format query succeeds but no process has it open, it's just configured
+            :
+        fi
     fi
     
-    # Check media controller for ISP pipeline
+    # Check media controller for ISP pipeline existence (but don't rely on ENABLED links alone)
+    # ENABLED just means configured, not actively processing
     if media-ctl -p -d "$ISP_MEDIA" 2>/dev/null | grep -qi "rkisp"; then
         isp_accessible=1
-        # Check if pipeline is active
-        if media-ctl -p -d "$ISP_MEDIA" 2>/dev/null | grep -q "ENABLED"; then
-            isp_active=1
-        fi
+        # Only mark as active if we confirmed a process is using it
+        # (already checked above with fuser/lsof)
     fi
     
     echo "$isp_active|$isp_accessible|$isp_in_use"
